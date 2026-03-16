@@ -24,6 +24,8 @@ on:
         default: 10
   repository_dispatch:
     types: [spool-upload]
+  issue_comment:
+    types: [created]
 
 permissions:
   contents: write
@@ -35,26 +37,13 @@ concurrency:
 jobs:
   upload:
     runs-on: ubuntu-latest
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'repository_dispatch' ||
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '/spool-upload'))
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
-
-      - name: Enforce rate limit
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          limit=${{ github.event.inputs.rate_limit_minutes || 10 }}
-          workflow_id=$(gh api /repos/${{ github.repository }}/actions/workflows --jq '.workflows[] | select(.name=="Spool Upload") | .id')
-          last_run=$(gh api /repos/${{ github.repository }}/actions/workflows/$workflow_id/runs?per_page=1 --jq '.workflow_runs[0].created_at')
-          if [ -n "$last_run" ]; then
-            last_ts=$(date -d "$last_run" +%s)
-            now=$(date +%s)
-            diff=$(( (now - last_ts) / 60 ))
-            if [ $diff -lt $limit ]; then
-              echo "Rate limit active: ${diff}m since last upload (limit ${limit}m)"
-              exit 1
-            fi
-          fi
 
       - name: Resolve payload
         id: payload
@@ -65,12 +54,75 @@ jobs:
             echo "git=${{ github.event.client_payload.git }}" >> $GITHUB_OUTPUT
             echo "tag=${{ github.event.client_payload.tag }}" >> $GITHUB_OUTPUT
             echo "summary=${{ github.event.client_payload.summary }}" >> $GITHUB_OUTPUT
+            echo "rate_limit_minutes=${{ github.event.client_payload.rate_limit_minutes }}" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event_name }}" = "issue_comment" ]; then
+            COMMENT="${{ github.event.comment.body }}" python - <<'PY'
+import os
+import shlex
+
+body = os.environ.get("COMMENT", "")
+line = None
+for raw in body.splitlines():
+    if "/spool-upload" in raw:
+        line = raw
+        break
+if not line:
+    raise SystemExit(0)
+idx = line.find("/spool-upload")
+args = line[idx + len("/spool-upload"):].strip()
+tokens = shlex.split(args)
+values = {}
+for token in tokens:
+    if "=" in token:
+        key, value = token.split("=", 1)
+        values[key.strip()] = value.strip()
+
+out_path = os.environ["GITHUB_OUTPUT"]
+with open(out_path, "a", encoding="utf-8") as handle:
+    for key in ["name", "version", "git", "tag", "summary", "rate_limit_minutes"]:
+        if key in values:
+            handle.write(f"{key}={values[key]}\n")
+PY
           else
             echo "name=${{ inputs.name }}" >> $GITHUB_OUTPUT
             echo "version=${{ inputs.version }}" >> $GITHUB_OUTPUT
             echo "git=${{ inputs.git }}" >> $GITHUB_OUTPUT
             echo "tag=${{ inputs.tag }}" >> $GITHUB_OUTPUT
             echo "summary=${{ inputs.summary }}" >> $GITHUB_OUTPUT
+            echo "rate_limit_minutes=${{ inputs.rate_limit_minutes }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Enforce rate limit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          limit="${{ steps.payload.outputs.rate_limit_minutes }}"
+          if [ -z "$limit" ]; then
+            limit=2
+          fi
+
+          workflow_id=$(gh api /repos/${{ github.repository }}/actions/workflows --jq '.workflows[] | select(.name=="Spool Upload") | .id')
+          last_run=$(gh api /repos/${{ github.repository }}/actions/workflows/$workflow_id/runs?per_page=1 --jq '.workflow_runs[0].created_at')
+          if [ -n "$last_run" ]; then
+            last_ts=$(date -d "$last_run" +%s)
+            now=$(date +%s)
+            diff=$(( (now - last_ts) / 60 ))
+            if [ $diff -lt $limit ]; then
+              echo "Global rate limit active: ${diff}m since last upload (limit ${limit}m)"
+              exit 1
+            fi
+          fi
+
+          actor="${{ github.actor }}"
+          last_actor_run=$(gh api /repos/${{ github.repository }}/actions/workflows/$workflow_id/runs?per_page=1\&actor=$actor --jq '.workflow_runs[0].created_at')
+          if [ -n "$last_actor_run" ]; then
+            last_ts=$(date -d "$last_actor_run" +%s)
+            now=$(date +%s)
+            diff=$(( (now - last_ts) / 60 ))
+            if [ $diff -lt $limit ]; then
+              echo "Actor rate limit active: ${diff}m since last upload (limit ${limit}m)"
+              exit 1
+            fi
           fi
 
       - name: Generate spool entry
