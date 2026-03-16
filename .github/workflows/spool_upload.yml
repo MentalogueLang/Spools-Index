@@ -1,0 +1,112 @@
+name: Spool Upload
+
+on:
+  workflow_dispatch:
+    inputs:
+      name:
+        description: Spool name
+        required: true
+      version:
+        description: Spool version (no leading v)
+        required: true
+      git:
+        description: Source git URL
+        required: true
+      tag:
+        description: Source tag (optional)
+        required: false
+      summary:
+        description: Short summary (optional)
+        required: false
+      rate_limit_minutes:
+        description: Minimum minutes between uploads
+        required: false
+        default: 10
+  repository_dispatch:
+    types: [spool-upload]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: spool-upload
+  cancel-in-progress: false
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Enforce rate limit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          limit=${{ github.event.inputs.rate_limit_minutes || 10 }}
+          workflow_id=$(gh api /repos/${{ github.repository }}/actions/workflows --jq '.workflows[] | select(.name=="Spool Upload") | .id')
+          last_run=$(gh api /repos/${{ github.repository }}/actions/workflows/$workflow_id/runs?per_page=1 --jq '.workflow_runs[0].created_at')
+          if [ -n "$last_run" ]; then
+            last_ts=$(date -d "$last_run" +%s)
+            now=$(date +%s)
+            diff=$(( (now - last_ts) / 60 ))
+            if [ $diff -lt $limit ]; then
+              echo "Rate limit active: ${diff}m since last upload (limit ${limit}m)"
+              exit 1
+            fi
+          fi
+
+      - name: Resolve payload
+        id: payload
+        run: |
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            echo "name=${{ github.event.client_payload.name }}" >> $GITHUB_OUTPUT
+            echo "version=${{ github.event.client_payload.version }}" >> $GITHUB_OUTPUT
+            echo "git=${{ github.event.client_payload.git }}" >> $GITHUB_OUTPUT
+            echo "tag=${{ github.event.client_payload.tag }}" >> $GITHUB_OUTPUT
+            echo "summary=${{ github.event.client_payload.summary }}" >> $GITHUB_OUTPUT
+          else
+            echo "name=${{ inputs.name }}" >> $GITHUB_OUTPUT
+            echo "version=${{ inputs.version }}" >> $GITHUB_OUTPUT
+            echo "git=${{ inputs.git }}" >> $GITHUB_OUTPUT
+            echo "tag=${{ inputs.tag }}" >> $GITHUB_OUTPUT
+            echo "summary=${{ inputs.summary }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Generate spool entry
+        run: |
+          name="${{ steps.payload.outputs.name }}"
+          version="${{ steps.payload.outputs.version }}"
+          git="${{ steps.payload.outputs.git }}"
+          tag="${{ steps.payload.outputs.tag }}"
+          summary="${{ steps.payload.outputs.summary }}"
+          if [ -z "$name" ] || [ -z "$version" ] || [ -z "$git" ]; then
+            echo "Missing required spool fields"
+            exit 1
+          fi
+
+          dir="entries/$name/$version"
+          mkdir -p "$dir"
+          file="$dir/spool.toml"
+          {
+            echo "[package]"
+            echo "name = \"$name\""
+            echo "version = \"$version\""
+            if [ -n "$summary" ]; then
+              echo "summary = \"$summary\""
+            fi
+            echo ""
+            echo "[source]"
+            echo "git = \"$git\""
+            if [ -n "$tag" ]; then
+              echo "tag = \"$tag\""
+            fi
+          } > "$file"
+
+      - name: Commit spool entry
+        run: |
+          git config user.name "spool-bot"
+          git config user.email "spool-bot@users.noreply.github.com"
+          git add entries
+          git commit -m "spool: add ${{ steps.payload.outputs.name }} ${{ steps.payload.outputs.version }}"
+          git push
