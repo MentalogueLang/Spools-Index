@@ -145,79 +145,61 @@ jobs:
 
       - name: Enforce rate limit
         id: limits
+        shell: bash
         env:
-          GH_TOKEN: ${{ github.token }}
           SPOOL_TOML: ${{ steps.payload.outputs.spool_toml }}
           SPOOL_NAME: ${{ steps.payload.outputs.name }}
           SPOOL_VERSION: ${{ steps.payload.outputs.version }}
+          RATE_LIMIT_MINUTES: ${{ steps.payload.outputs.rate_limit_minutes }}
         run: |
-          requested_limit="${{ steps.payload.outputs.rate_limit_minutes }}"
-          if [ -z "$requested_limit" ]; then
-            requested_limit=0
-          fi
+          python - <<'PY'
+          import os
+          import pathlib
+          import tomllib
 
-          spool_toml="$SPOOL_TOML"
-          name="$SPOOL_NAME"
-          version="$SPOOL_VERSION"
+          def bucket_for(name: str) -> str:
+              lower = name.strip().lower()
+              if lower.startswith("lib"):
+                  return "lib"
+              if lower and "a" <= lower[0] <= "z":
+                  return lower[0]
+              return "lib"
 
-          if [ -n "$spool_toml" ]; then
-            mapfile -t parsed < <(python - <<'PY'
-import os
-import tomllib
+          requested_limit = int((os.environ.get("RATE_LIMIT_MINUTES") or "0").strip() or "0")
+          spool_toml = os.environ.get("SPOOL_TOML", "").strip()
+          name = os.environ.get("SPOOL_NAME", "").strip()
+          version = os.environ.get("SPOOL_VERSION", "").strip()
 
-source = os.environ.get("SPOOL_TOML", "")
-data = tomllib.loads(source)
-package = data.get("package", {})
-print(str(package.get("name", "")).strip())
-print(str(package.get("version", "")).strip())
-PY
-)
-            if [ -z "$name" ]; then
-              name="${parsed[0]}"
-            fi
-            if [ -z "$version" ]; then
-              version="${parsed[1]}"
-            fi
-          fi
+          if spool_toml:
+              data = tomllib.loads(spool_toml)
+              package = data.get("package", {})
+              if not name:
+                  name = str(package.get("name", "")).strip()
+              if not version:
+                  version = str(package.get("version", "")).strip()
 
-          if [ -z "$name" ] || [ -z "$version" ]; then
-            echo "missing spool package name/version"
-            exit 1
-          fi
+          if not name or not version:
+              raise SystemExit("missing spool package name/version")
 
-          bucket=$(SPOOL_PACKAGE_NAME="$name" python - <<'PY'
-import os
-name = os.environ.get("SPOOL_PACKAGE_NAME", "").strip().lower()
-if name.startswith("lib"):
-    print("lib")
-elif name and "a" <= name[0] <= "z":
-    print(name[0])
-else:
-    print("lib")
-PY
-)
+          path = pathlib.Path("entries") / bucket_for(name) / name / version / "spool.toml"
+          if path.exists():
+              mode = "update"
+              min_limit = 5
+              package_limit = 3
+          else:
+              mode = "publish"
+              min_limit = 30
+              package_limit = 15
 
-          path="entries/$bucket/$name/$version/spool.toml"
-          if [ -f "$path" ]; then
-            mode="update"
-            min_limit=5
-            package_limit=3
-          else
-            mode="publish"
-            min_limit=30
-            package_limit=15
-          fi
+          limit = max(requested_limit, min_limit)
 
-          limit=$requested_limit
-          if [ "$limit" -lt "$min_limit" ]; then
-            limit=$min_limit
-          fi
-
-          echo "mode=$mode" >> $GITHUB_OUTPUT
-          echo "limit=$limit" >> $GITHUB_OUTPUT
-          echo "package_limit=$package_limit" >> $GITHUB_OUTPUT
-          echo "name=$name" >> $GITHUB_OUTPUT
-          echo "version=$version" >> $GITHUB_OUTPUT
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+              handle.write(f"mode={mode}\n")
+              handle.write(f"limit={limit}\n")
+              handle.write(f"package_limit={package_limit}\n")
+              handle.write(f"name={name}\n")
+              handle.write(f"version={version}\n")
+          PY
 
       - name: Enforce cooldowns
         env:
