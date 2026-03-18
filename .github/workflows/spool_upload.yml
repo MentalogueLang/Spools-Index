@@ -205,6 +205,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          actor="${{ github.actor }}"
+          case "$actor" in
+            MINTILER-DEV)
+              echo "Skipping cooldowns for trusted publisher $actor"
+              exit 0
+              ;;
+          esac
+
           limit="${{ steps.limits.outputs.limit }}"
           package_limit="${{ steps.limits.outputs.package_limit }}"
           mode="${{ steps.limits.outputs.mode }}"
@@ -223,7 +231,6 @@ jobs:
             fi
           fi
 
-          actor="${{ github.actor }}"
           last_actor_run=$(gh api /repos/${{ github.repository }}/actions/workflows/$workflow_id/runs?per_page=20 --jq ".workflow_runs[] | select(.actor.login==\"$actor\") | .created_at" | head -n 1)
           if [ -n "$last_actor_run" ] && [ "$last_actor_run" != "null" ]; then
             last_ts=$(date -d "$last_actor_run" +%s)
