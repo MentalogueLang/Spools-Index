@@ -5,18 +5,24 @@ on:
     inputs:
       name:
         description: Spool name
-        required: true
+        required: false
       version:
         description: Spool version (no leading v)
-        required: true
+        required: false
       git:
         description: Source git URL
-        required: true
+        required: false
       tag:
         description: Source tag (optional)
         required: false
       summary:
         description: Short summary (optional)
+        required: false
+      entry:
+        description: Build entry path (optional)
+        required: false
+      spool_toml:
+        description: Full spool.toml content (optional)
         required: false
       rate_limit_minutes:
         description: Minimum minutes between uploads
@@ -40,57 +46,102 @@ jobs:
     if: >
       github.event_name == 'workflow_dispatch' ||
       github.event_name == 'repository_dispatch' ||
-      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '/spool-upload'))
+      (github.event_name == 'issue_comment' &&
+        (contains(github.event.comment.body, '/spool-upload') ||
+         contains(github.event.comment.body, '/spool-upload-toml')))
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
       - name: Resolve payload
         id: payload
+        shell: bash
+        env:
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          RD_NAME: ${{ github.event.client_payload.name }}
+          RD_VERSION: ${{ github.event.client_payload.version }}
+          RD_GIT: ${{ github.event.client_payload.git }}
+          RD_TAG: ${{ github.event.client_payload.tag }}
+          RD_SUMMARY: ${{ github.event.client_payload.summary }}
+          RD_ENTRY: ${{ github.event.client_payload.entry }}
+          RD_SPOOL_TOML: ${{ github.event.client_payload.spool_toml }}
+          RD_RATE_LIMIT_MINUTES: ${{ github.event.client_payload.rate_limit_minutes }}
+          WD_NAME: ${{ inputs.name }}
+          WD_VERSION: ${{ inputs.version }}
+          WD_GIT: ${{ inputs.git }}
+          WD_TAG: ${{ inputs.tag }}
+          WD_SUMMARY: ${{ inputs.summary }}
+          WD_ENTRY: ${{ inputs.entry }}
+          WD_SPOOL_TOML: ${{ inputs.spool_toml }}
+          WD_RATE_LIMIT_MINUTES: ${{ inputs.rate_limit_minutes }}
         run: |
-          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
-            echo "name=${{ github.event.client_payload.name }}" >> $GITHUB_OUTPUT
-            echo "version=${{ github.event.client_payload.version }}" >> $GITHUB_OUTPUT
-            echo "git=${{ github.event.client_payload.git }}" >> $GITHUB_OUTPUT
-            echo "tag=${{ github.event.client_payload.tag }}" >> $GITHUB_OUTPUT
-            echo "summary=${{ github.event.client_payload.summary }}" >> $GITHUB_OUTPUT
-            echo "rate_limit_minutes=${{ github.event.client_payload.rate_limit_minutes }}" >> $GITHUB_OUTPUT
-          elif [ "${{ github.event_name }}" = "issue_comment" ]; then
-            COMMENT="${{ github.event.comment.body }}" python - <<'PY'
-import os
-import shlex
+          python - <<'PY'
+          import os
+          import shlex
 
-body = os.environ.get("COMMENT", "")
-line = None
-for raw in body.splitlines():
-    if "/spool-upload" in raw:
-        line = raw
-        break
-if not line:
-    raise SystemExit(0)
-idx = line.find("/spool-upload")
-args = line[idx + len("/spool-upload"):].strip()
-tokens = shlex.split(args)
-values = {}
-for token in tokens:
-    if "=" in token:
-        key, value = token.split("=", 1)
-        values[key.strip()] = value.strip()
+          event_name = os.environ.get("GITHUB_EVENT_NAME", "")
+          output_path = os.environ["GITHUB_OUTPUT"]
+          values = {}
 
-out_path = os.environ["GITHUB_OUTPUT"]
-with open(out_path, "a", encoding="utf-8") as handle:
-    for key in ["name", "version", "git", "tag", "summary", "rate_limit_minutes"]:
-        if key in values:
-            handle.write(f"{key}={values[key]}\n")
-PY
-          else
-            echo "name=${{ inputs.name }}" >> $GITHUB_OUTPUT
-            echo "version=${{ inputs.version }}" >> $GITHUB_OUTPUT
-            echo "git=${{ inputs.git }}" >> $GITHUB_OUTPUT
-            echo "tag=${{ inputs.tag }}" >> $GITHUB_OUTPUT
-            echo "summary=${{ inputs.summary }}" >> $GITHUB_OUTPUT
-            echo "rate_limit_minutes=${{ inputs.rate_limit_minutes }}" >> $GITHUB_OUTPUT
-          fi
+          def write(key, value):
+              if value is None:
+                  return
+              with open(output_path, "a", encoding="utf-8") as handle:
+                  handle.write(f"{key}<<__VALUE__\n{value}\n__VALUE__\n")
+
+          if event_name == "repository_dispatch":
+              prefix = "RD_"
+              for key in ["name", "version", "git", "tag", "summary", "entry", "spool_toml", "rate_limit_minutes"]:
+                  value = os.environ.get(prefix + key.upper())
+                  if value:
+                      values[key] = value
+          elif event_name == "workflow_dispatch":
+              prefix = "WD_"
+              for key in ["name", "version", "git", "tag", "summary", "entry", "spool_toml", "rate_limit_minutes"]:
+                  value = os.environ.get(prefix + key.upper())
+                  if value:
+                      values[key] = value
+          else:
+              body = os.environ.get("COMMENT_BODY", "")
+              lines = body.splitlines()
+              command_line = None
+              command = None
+              for index, raw in enumerate(lines):
+                  if "/spool-upload-toml" in raw:
+                      command_line = index
+                      command = "toml"
+                      break
+                  if "/spool-upload" in raw:
+                      command_line = index
+                      command = "fields"
+                      break
+
+              if command_line is not None:
+                  line = lines[command_line]
+                  marker = "/spool-upload-toml" if command == "toml" else "/spool-upload"
+                  args = line[line.find(marker) + len(marker):].strip()
+                  for token in shlex.split(args):
+                      if "=" in token:
+                          key, value = token.split("=", 1)
+                          values[key.strip()] = value.strip()
+
+                  if command == "toml":
+                      fence_start = None
+                      for index in range(command_line + 1, len(lines)):
+                          if lines[index].strip().startswith("```toml"):
+                              fence_start = index + 1
+                              break
+                      if fence_start is not None:
+                          collected = []
+                          for index in range(fence_start, len(lines)):
+                              if lines[index].strip() == "```":
+                                  break
+                              collected.append(lines[index])
+                          values["spool_toml"] = "\n".join(collected).strip()
+
+          for key, value in values.items():
+              write(key, value)
+          PY
 
       - name: Enforce rate limit
         env:
@@ -103,7 +154,7 @@ PY
 
           workflow_id=$(gh api /repos/${{ github.repository }}/actions/workflows --jq '.workflows[] | select(.name=="Spool Upload") | .id')
           last_run=$(gh api /repos/${{ github.repository }}/actions/workflows/$workflow_id/runs?per_page=1 --jq '.workflow_runs[0].created_at')
-          if [ -n "$last_run" ]; then
+          if [ -n "$last_run" ] && [ "$last_run" != "null" ]; then
             last_ts=$(date -d "$last_run" +%s)
             now=$(date +%s)
             diff=$(( (now - last_ts) / 60 ))
@@ -114,8 +165,8 @@ PY
           fi
 
           actor="${{ github.actor }}"
-          last_actor_run=$(gh api /repos/${{ github.repository }}/actions/workflows/$workflow_id/runs?per_page=1\&actor=$actor --jq '.workflow_runs[0].created_at')
-          if [ -n "$last_actor_run" ]; then
+          last_actor_run=$(gh api /repos/${{ github.repository }}/actions/workflows/$workflow_id/runs?per_page=20 --jq ".workflow_runs[] | select(.actor.login==\"$actor\") | .created_at" | head -n 1)
+          if [ -n "$last_actor_run" ] && [ "$last_actor_run" != "null" ]; then
             last_ts=$(date -d "$last_actor_run" +%s)
             now=$(date +%s)
             diff=$(( (now - last_ts) / 60 ))
@@ -126,39 +177,87 @@ PY
           fi
 
       - name: Generate spool entry
+        shell: bash
+        env:
+          PAYLOAD_NAME: ${{ steps.payload.outputs.name }}
+          PAYLOAD_VERSION: ${{ steps.payload.outputs.version }}
+          PAYLOAD_GIT: ${{ steps.payload.outputs.git }}
+          PAYLOAD_TAG: ${{ steps.payload.outputs.tag }}
+          PAYLOAD_SUMMARY: ${{ steps.payload.outputs.summary }}
+          PAYLOAD_ENTRY: ${{ steps.payload.outputs.entry }}
+          PAYLOAD_SPOOL_TOML: ${{ steps.payload.outputs.spool_toml }}
         run: |
-          name="${{ steps.payload.outputs.name }}"
-          version="${{ steps.payload.outputs.version }}"
-          git="${{ steps.payload.outputs.git }}"
-          tag="${{ steps.payload.outputs.tag }}"
-          summary="${{ steps.payload.outputs.summary }}"
-          if [ -z "$name" ] || [ -z "$version" ] || [ -z "$git" ]; then
-            echo "Missing required spool fields"
-            exit 1
-          fi
+          python - <<'PY'
+          import os
+          import pathlib
+          import sys
+          import tomllib
 
-          dir="entries/$name/$version"
-          mkdir -p "$dir"
-          file="$dir/spool.toml"
-          {
-            echo "[package]"
-            echo "name = \"$name\""
-            echo "version = \"$version\""
-            if [ -n "$summary" ]; then
-              echo "summary = \"$summary\""
-            fi
-            echo ""
-            echo "[source]"
-            echo "git = \"$git\""
-            if [ -n "$tag" ]; then
-              echo "tag = \"$tag\""
-            fi
-          } > "$file"
+          def bucket_for(name: str) -> str:
+              lower = name.strip().lower()
+              if lower.startswith("lib"):
+                  return "lib"
+              if lower and "a" <= lower[0] <= "z":
+                  return lower[0]
+              return "lib"
+
+          spool_toml = os.environ.get("PAYLOAD_SPOOL_TOML", "").strip()
+          if not spool_toml:
+              name = os.environ.get("PAYLOAD_NAME", "").strip()
+              version = os.environ.get("PAYLOAD_VERSION", "").strip()
+              git = os.environ.get("PAYLOAD_GIT", "").strip()
+              tag = os.environ.get("PAYLOAD_TAG", "").strip()
+              summary = os.environ.get("PAYLOAD_SUMMARY", "").strip()
+              entry = os.environ.get("PAYLOAD_ENTRY", "").strip()
+              if not name or not version or not git:
+                  raise SystemExit("Missing required spool fields")
+
+              lines = [
+                  "[package]",
+                  f'name = "{name}"',
+                  f'version = "{version}"',
+              ]
+              if summary:
+                  lines.append(f'summary = "{summary}"')
+              lines.extend([
+                  "",
+                  "[source]",
+                  f'git = "{git}"',
+              ])
+              if tag:
+                  lines.append(f'tag = "{tag}"')
+              if entry:
+                  lines.extend([
+                      "",
+                      "[build]",
+                      f'entry = "{entry}"',
+                  ])
+              spool_toml = "\n".join(lines) + "\n"
+
+          data = tomllib.loads(spool_toml)
+          package = data.get("package", {})
+          name = str(package.get("name", "")).strip()
+          version = str(package.get("version", "")).strip()
+          if not name or not version:
+              raise SystemExit("spool.toml must contain [package] name/version")
+
+          bucket = bucket_for(name)
+          path = pathlib.Path("entries") / bucket / name / version
+          path.mkdir(parents=True, exist_ok=True)
+          file_path = path / "spool.toml"
+          file_path.write_text(spool_toml.rstrip() + "\n", encoding="utf-8")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+              handle.write(f"name={name}\n")
+              handle.write(f"version={version}\n")
+              handle.write(f"file={file_path.as_posix()}\n")
+          PY
 
       - name: Commit spool entry
         run: |
           git config user.name "spool-bot"
           git config user.email "spool-bot@users.noreply.github.com"
           git add entries
+          git diff --cached --quiet && exit 0
           git commit -m "spool: add ${{ steps.payload.outputs.name }} ${{ steps.payload.outputs.version }}"
           git push
