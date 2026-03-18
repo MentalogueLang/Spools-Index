@@ -1,0 +1,10 @@
+[package]
+name = "mtl_json"
+version = "0.1.0"
+summary = "Deterministic JSON parsing and querying for Mentalogue."
+
+[source]
+git = "D:/GitHub/Repositories/Mentalogue"
+
+[build]
+entry = "suture_package_dev/mtl-json/lib.mtl"
