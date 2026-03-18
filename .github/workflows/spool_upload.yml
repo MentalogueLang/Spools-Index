@@ -144,13 +144,90 @@ jobs:
           PY
 
       - name: Enforce rate limit
+        id: limits
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SPOOL_TOML: ${{ steps.payload.outputs.spool_toml }}
+          SPOOL_NAME: ${{ steps.payload.outputs.name }}
+          SPOOL_VERSION: ${{ steps.payload.outputs.version }}
+        run: |
+          requested_limit="${{ steps.payload.outputs.rate_limit_minutes }}"
+          if [ -z "$requested_limit" ]; then
+            requested_limit=0
+          fi
+
+          spool_toml="$SPOOL_TOML"
+          name="$SPOOL_NAME"
+          version="$SPOOL_VERSION"
+
+          if [ -n "$spool_toml" ]; then
+            mapfile -t parsed < <(python - <<'PY'
+import os
+import tomllib
+
+source = os.environ.get("SPOOL_TOML", "")
+data = tomllib.loads(source)
+package = data.get("package", {})
+print(str(package.get("name", "")).strip())
+print(str(package.get("version", "")).strip())
+PY
+)
+            if [ -z "$name" ]; then
+              name="${parsed[0]}"
+            fi
+            if [ -z "$version" ]; then
+              version="${parsed[1]}"
+            fi
+          fi
+
+          if [ -z "$name" ] || [ -z "$version" ]; then
+            echo "missing spool package name/version"
+            exit 1
+          fi
+
+          bucket=$(SPOOL_PACKAGE_NAME="$name" python - <<'PY'
+import os
+name = os.environ.get("SPOOL_PACKAGE_NAME", "").strip().lower()
+if name.startswith("lib"):
+    print("lib")
+elif name and "a" <= name[0] <= "z":
+    print(name[0])
+else:
+    print("lib")
+PY
+)
+
+          path="entries/$bucket/$name/$version/spool.toml"
+          if [ -f "$path" ]; then
+            mode="update"
+            min_limit=5
+            package_limit=3
+          else
+            mode="publish"
+            min_limit=30
+            package_limit=15
+          fi
+
+          limit=$requested_limit
+          if [ "$limit" -lt "$min_limit" ]; then
+            limit=$min_limit
+          fi
+
+          echo "mode=$mode" >> $GITHUB_OUTPUT
+          echo "limit=$limit" >> $GITHUB_OUTPUT
+          echo "package_limit=$package_limit" >> $GITHUB_OUTPUT
+          echo "name=$name" >> $GITHUB_OUTPUT
+          echo "version=$version" >> $GITHUB_OUTPUT
+
+      - name: Enforce cooldowns
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          limit="${{ steps.payload.outputs.rate_limit_minutes }}"
-          if [ -z "$limit" ]; then
-            limit=2
-          fi
+          limit="${{ steps.limits.outputs.limit }}"
+          package_limit="${{ steps.limits.outputs.package_limit }}"
+          mode="${{ steps.limits.outputs.mode }}"
+          name="${{ steps.limits.outputs.name }}"
+          version="${{ steps.limits.outputs.version }}"
 
           workflow_id=$(gh api /repos/${{ github.repository }}/actions/workflows --jq '.workflows[] | select(.name=="Spool Upload") | .id')
           last_run=$(gh api /repos/${{ github.repository }}/actions/workflows/$workflow_id/runs?per_page=1 --jq '.workflow_runs[0].created_at')
@@ -171,12 +248,31 @@ jobs:
             now=$(date +%s)
             diff=$(( (now - last_ts) / 60 ))
             if [ $diff -lt $limit ]; then
-              echo "Actor rate limit active: ${diff}m since last upload (limit ${limit}m)"
+              echo "Actor $mode cooldown active: ${diff}m since last upload (limit ${limit}m)"
               exit 1
             fi
           fi
 
+          search="${name} ${version}"
+          if [ -n "$name" ] && [ -n "$version" ]; then
+            issue_number="${{ github.event.issue.number }}"
+            if [ -z "$issue_number" ] || [ "$issue_number" = "null" ]; then
+              issue_number=1
+            fi
+            last_package_comment=$(gh api /repos/${{ github.repository }}/issues/$issue_number/comments --paginate --jq ".[] | select(.body | contains(\"$search\")) | .created_at" | tail -n 1)
+            if [ -n "$last_package_comment" ] && [ "$last_package_comment" != "null" ]; then
+              last_ts=$(date -d "$last_package_comment" +%s)
+              now=$(date +%s)
+              diff=$(( (now - last_ts) / 60 ))
+              if [ $diff -lt $package_limit ]; then
+                echo "Package cooldown active for $name $version: ${diff}m since last request (limit ${package_limit}m)"
+                exit 1
+              fi
+            fi
+          fi
+
       - name: Generate spool entry
+        id: generate
         shell: bash
         env:
           PAYLOAD_NAME: ${{ steps.payload.outputs.name }}
@@ -259,5 +355,5 @@ jobs:
           git config user.email "spool-bot@users.noreply.github.com"
           git add entries
           git diff --cached --quiet && exit 0
-          git commit -m "spool: add ${{ steps.payload.outputs.name }} ${{ steps.payload.outputs.version }}"
+          git commit -m "spool: add ${{ steps.generate.outputs.name }} ${{ steps.generate.outputs.version }}"
           git push
