@@ -1,0 +1,10 @@
+[package]
+name = "mtl_gzip"
+version = "0.1.0"
+summary = "Gzip/content-encoding detection helpers for MTL."
+
+[source]
+git = "https://github.com/MINTILER-DEV/mtl-gzip"
+
+[build]
+entry = "lib.mtl"
