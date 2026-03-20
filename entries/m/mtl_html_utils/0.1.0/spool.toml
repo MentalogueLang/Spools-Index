@@ -1,0 +1,10 @@
+[package]
+name = "mtl_html_utils"
+version = "0.1.0"
+summary = "Deterministic HTML-oriented string analyzers for MTL."
+
+[source]
+git = "https://github.com/MINTILER-DEV/mtl-html-utils"
+
+[build]
+entry = "lib.mtl"
