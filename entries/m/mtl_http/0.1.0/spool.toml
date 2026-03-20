@@ -1,0 +1,10 @@
+[package]
+name = "mtl_http"
+version = "0.1.0"
+summary = "Policy-first HTTP helpers with sandbox-friendly URL and size guards."
+
+[source]
+git = "https://github.com/MINTILER-DEV/mtl-http"
+
+[build]
+entry = "lib.mtl"
